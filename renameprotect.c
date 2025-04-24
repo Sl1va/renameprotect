@@ -1,6 +1,4 @@
 /*
- * wmtd-rw - Make specified list of MTD partitions writeable
- *
  * Copyright (C), 2025, Emil Latypov <emillatypov9335@gmail.com>
  *
  * This program is free software; you can redistribute it and/or
@@ -23,11 +21,12 @@
  */
 
 #include <linux/dcache.h>
+#include <linux/fs_struct.h>
+#include <linux/highmem.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
-#include <linux/string.h>
 
 #ifndef MODULE
 #error "Must be compiled as a module."
@@ -39,18 +38,44 @@
 #define MOD_ERR KERN_ERR MOD_LOG
 
 #define FILTER_EXTENSION ".txt"
-#define FILTER_LEN strlen(FILTER_EXTENSION)
+#define FILTER_EXT_LEN strlen(FILTER_EXTENSION)
+#define FILTER_HEADER_LEN 16
 
-static char *prothead = "";
-module_param(prothead, charp, S_IRUGO);
-MODULE_PARM_DESC(
-    prothead,
-    "16-bytes header to activate rename protection at all *.txt files");
+static char *prothead = "aaaabbbbccccdddd";
+// module_param(prothead, charp, S_IRUGO);
+// MODULE_PARM_DESC(
+// prothead,
+// "16-bytes header to activate rename protection at all *.txt files");
 
 static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs);
 
 static struct kprobe kp_rename = {.symbol_name = "vfs_rename",
                                   .pre_handler = vfs_rename_handler};
+
+static ssize_t read_header(struct dentry *dentry, u8 *header) {
+    struct path root;
+    struct file *filerd;
+    ssize_t bytes_read;
+    mm_segment_t old_fs;
+
+    task_lock(&init_task);
+    get_fs_root(init_task.fs, &root);
+    task_unlock(&init_task);
+
+    root.dentry = dentry;
+
+    filerd = file_open_root(root.dentry->d_parent, root.mnt,
+                            root.dentry->d_name.name, O_RDONLY, 0);
+
+    old_fs = get_fs();  // Save the current address limit
+    set_fs(KERNEL_DS);  // Set the address limit to kernel space
+
+    bytes_read = kernel_read(filerd, header, FILTER_HEADER_LEN, NULL);
+    filp_close(filerd, NULL);
+    set_fs(old_fs);
+
+    return bytes_read;
+}
 
 static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs) {
     /*
@@ -67,23 +92,28 @@ static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs) {
     accessed via their order (see regs_get_kernel_argument)
     */
 
-    struct dentry *old_dentry =
-        (struct dentry *)regs_get_kernel_argument(regs, 1);
+    struct dentry *dentry = (struct dentry *)regs_get_kernel_argument(regs, 1);
 
-    u32 oldlen = old_dentry->d_name.len;
-    const char *oldname = old_dentry->d_name.name;
+    u32 oldlen = dentry->d_name.len;
+    const char *oldname = dentry->d_name.name;
 
-    if (oldlen < FILTER_LEN) {
+    if (oldlen < FILTER_EXT_LEN) {
         return 0;
     }
 
-    if (!memcmp(oldname + oldlen - FILTER_LEN, FILTER_EXTENSION, FILTER_LEN)) {
-        printk(MOD_INFO "%s rename were rejected\n", oldname);
+    if (!memcmp(oldname + oldlen - FILTER_EXT_LEN, FILTER_EXTENSION,
+                FILTER_EXT_LEN)) {
+        u8 header[FILTER_HEADER_LEN] = {0};
+        ssize_t bytes_read = read_header(dentry, header);
 
-        // Make vfs_rename think that source filename
-        // has zero lengths, so it will lead to operation
-        // fail automatically
-        old_dentry->d_name.len = 0;
+        if (bytes_read == sizeof(header) &&
+            !memcmp(prothead, header, bytes_read)) {
+            // Make vfs_rename think that source filename
+            // has zero lengths, so it will lead to operation
+            // fail automatically
+            dentry->d_name.len = 0;
+            printk(MOD_INFO "%s rename were rejected\n", oldname);
+        }
     }
 
     return 0;
