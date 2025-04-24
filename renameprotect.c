@@ -22,11 +22,12 @@
  *   TBD
  */
 
-#include <asm/unistd.h>
+#include <linux/dcache.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
+#include <linux/kprobes.h>
 #include <linux/module.h>
-#include <linux/syscalls.h>
+#include <linux/string.h>
 
 #ifndef MODULE
 #error "Must be compiled as a module."
@@ -37,36 +38,55 @@
 #define MOD_INFO KERN_INFO MOD_LOG
 #define MOD_ERR KERN_ERR MOD_LOG
 
+#define FILTER_EXTENSION ".txt"
+#define FILTER_LEN strlen(FILTER_EXTENSION)
+
 static char *prothead = "";
 module_param(prothead, charp, S_IRUGO);
 MODULE_PARM_DESC(
     prothead,
     "16-bytes header to activate rename protection at all *.txt files");
 
-static void **sys_call_table;
+static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs);
 
-asmlinkage long (*orig_sys_rename)(const char __user *, const char __user *);
-asmlinkage long fake_sys_rename(const char __user *oldname,
-                                const char __user *newname) {
-    printk(MOD_ERR "Oh shit it works (%s)\n", __func__);
-    return orig_sys_rename(oldname, newname);
-}
+static struct kprobe kp_rename = {.symbol_name = "vfs_rename",
+                                  .pre_handler = vfs_rename_handler};
 
-asmlinkage long (*orig_sys_renameat)(int, const char __user *, int,
-                                     const char __user *);
-asmlinkage long fake_sys_renameat(int olddfd, const char __user *oldname,
-                                  int newdfd, const char __user *newname) {
-    printk(MOD_ERR "Oh shit it works (%s)\n", __func__);
-    return orig_sys_renameat(olddfd, oldname, newdfd, newname);
-}
+static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs) {
+    /*
+    The vfs_rename function prototype is following:
 
-asmlinkage long (*orig_sys_renameat2)(int, const char __user *, int,
-                                      const char __user *, unsigned int);
-asmlinkage long fake_sys_renameat2(int olddfd, const char __user *oldname,
-                                   int newdfd, const char __user *newname,
-                                   unsigned int flags) {
-    printk(MOD_ERR "Oh shit it works (%s)\n", __func__);
-    return orig_sys_renameat2(olddfd, oldname, newdfd, newname, flags);
+    int vfs_rename(struct inode * old_dir,
+                    struct dentry * old_dentry,
+                    struct inode * new_dir,
+                    struct dentry * new_dentry,
+                    struct inode ** delegated_inode,
+                    unsigned int flags);
+
+    So, in order to address specified arguments, they can be
+    accessed via their order (see regs_get_kernel_argument)
+    */
+
+    struct dentry *old_dentry =
+        (struct dentry *)regs_get_kernel_argument(regs, 1);
+
+    u32 oldlen = old_dentry->d_name.len;
+    const char *oldname = old_dentry->d_name.name;
+
+    if (oldlen < FILTER_LEN) {
+        return 0;
+    }
+
+    if (!memcmp(oldname + oldlen - FILTER_LEN, FILTER_EXTENSION, FILTER_LEN)) {
+        printk(MOD_INFO "%s rename were rejected\n", oldname);
+
+        // Make vfs_rename think that source filename
+        // has zero lengths, so it will lead to operation
+        // fail automatically
+        old_dentry->d_name.len = 0;
+    }
+
+    return 0;
 }
 
 /**
@@ -75,22 +95,14 @@ asmlinkage long fake_sys_renameat2(int olddfd, const char __user *oldname,
  * @return int Non-zero error value on failure, otherwise 0
  */
 static int __init renameprotect_init(void) {
-    sys_call_table = (void *)kallsyms_lookup_name("sys_call_table");
-
-    if (!sys_call_table) {
-        printk(MOD_ERR "Failed to find sys_call_table\n");
-        return -EINVAL;
+    int retcode = register_kprobe(&kp_rename);
+    if (retcode == 0) {
+        printk(MOD_ERR "Registered hook for %s\n", kp_rename.symbol_name);
     } else {
-        printk(MOD_ERR "sys_call_table was successfully found\n");
+        printk(MOD_ERR "Failed to register hook for %s (%d)\n",
+               kp_rename.symbol_name, retcode);
+        return retcode;
     }
-
-    orig_sys_rename = sys_call_table[__NR_rename];
-    orig_sys_renameat = sys_call_table[__NR_renameat];
-    orig_sys_renameat2 = sys_call_table[__NR_renameat2];
-
-    sys_call_table[__NR_rename] = fake_sys_rename;
-    sys_call_table[__NR_renameat] = fake_sys_renameat;
-    sys_call_table[__NR_renameat2] = fake_sys_renameat2;
 
     return 0;
 }
@@ -98,11 +110,7 @@ static int __init renameprotect_init(void) {
 /**
  * @brief Kernel module deinitialization
  */
-static void __exit renameprotect_exit(void) {
-    sys_call_table[__NR_rename] = orig_sys_rename;
-    sys_call_table[__NR_renameat] = orig_sys_renameat;
-    sys_call_table[__NR_renameat2] = orig_sys_renameat2;
-}
+static void __exit renameprotect_exit(void) { unregister_kprobe(&kp_rename); }
 
 module_init(renameprotect_init);
 module_exit(renameprotect_exit);
