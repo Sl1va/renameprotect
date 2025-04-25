@@ -17,7 +17,9 @@
  * USA.
  *
  * Usage:
- *   TBD
+ *   sudo insmod renameprotect.ko prothead="aaaabbbbccccdddd"
+ * where prothread is 16-byte header to check on *.txt files before renaming
+ * (if the header mathces, rename operation will be rejected)
  */
 
 #include <linux/dcache.h>
@@ -41,11 +43,11 @@
 #define FILTER_EXT_LEN strlen(FILTER_EXTENSION)
 #define FILTER_HEADER_LEN 16
 
-static char *prothead = "aaaabbbbccccdddd";
-// module_param(prothead, charp, S_IRUGO);
-// MODULE_PARM_DESC(
-// prothead,
-// "16-bytes header to activate rename protection at all *.txt files");
+static char *prothead = "";
+module_param(prothead, charp, S_IRUGO);
+MODULE_PARM_DESC(
+    prothead,
+    "16-bytes header to activate rename protection at all *.txt files");
 
 static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs);
 
@@ -125,7 +127,17 @@ static int vfs_rename_handler(struct kprobe *p, struct pt_regs *regs) {
  * @return int Non-zero error value on failure, otherwise 0
  */
 static int __init renameprotect_init(void) {
-    int retcode = register_kprobe(&kp_rename);
+    int retcode;
+    unsigned long header_len;
+
+    header_len = strlen(prothead);
+    if (header_len != FILTER_HEADER_LEN) {
+        printk(MOD_ERR "Invalid prothead size. Expected %u, got %lu\n",
+               FILTER_HEADER_LEN, header_len);
+        return -EINVAL;
+    }
+
+    retcode = register_kprobe(&kp_rename);
     if (retcode == 0) {
         printk(MOD_ERR "Registered hook for %s\n", kp_rename.symbol_name);
     } else {
@@ -147,5 +159,5 @@ module_exit(renameprotect_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Emil Latypov <emillatypov9335@gmail.com>");
-MODULE_DESCRIPTION("TBD");
+MODULE_DESCRIPTION("Rename protection for *.txt files with specified header");
 MODULE_VERSION("1");
